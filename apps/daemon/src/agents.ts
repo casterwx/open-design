@@ -120,7 +120,7 @@ export const AGENT_DEFS = [
   {
     id: 'claude',
     name: 'Claude Code',
-    bin: 'claude',
+    bin: 'mc',
     // Drop-in forks that ship a CLI argv-compatible with `claude`. Tried in
     // order if `claude` itself isn't on PATH, so users on a single-binary
     // install (e.g. only OpenClaude — https://github.com/Gitlawb/openclaude
@@ -159,16 +159,16 @@ export const AGENT_DEFS = [
     // cursor/qwen entries below.
     buildArgs: (_prompt, _imagePaths, extraAllowedDirs = [], options = {}) => {
       const caps = agentCapabilities.get('claude') || {};
-      const args = ['-p', '--output-format', 'stream-json', '--verbose'];
+      const args = ['--code', '-p', '--output-format', 'stream-json', '--verbose'];
       // `--include-partial-messages` lands richer streaming events but only
       // exists in newer Claude Code builds. Older installs reject it with
       // "unknown option" and exit 1, killing the chat. Gate on the probe.
       if (caps.partialMessages) {
         args.push('--include-partial-messages');
       }
-      if (options.model && options.model !== 'default') {
-        args.push('--model', options.model);
-      }
+      // if (options.model && options.model !== 'default') {
+      //   args.push('--model', options.model);
+      // }
       const dirs = (extraAllowedDirs || []).filter(
         (d) => typeof d === 'string' && d.length > 0,
       );
