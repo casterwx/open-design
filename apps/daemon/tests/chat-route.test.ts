@@ -11,13 +11,14 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, join, resolve } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   composeLiveInstructionPrompt,
   resolveGrantedCodexImagegenOverride,
   resolveCodexGeneratedImagesDir,
   resolveChatExtraAllowedDirs,
+  resolveResearchCommandContract,
   startServer,
   validateCodexGeneratedImagesDir,
 } from '../src/server.js';
@@ -162,51 +163,43 @@ process.exit(0);
   });
 
   it('surfaces Qoder assistant error records through the SSE error channel', async () => {
-    const binDir = mkdtempSync(join(tmpdir(), 'od-qoder-bin-'));
-    tempDirs.push(binDir);
-    const qoderBin = join(binDir, 'qodercli');
     const qoderErrorLine = JSON.stringify({
       type: 'assistant',
       message: { content: [] },
       error: { message: 'Qoder authentication expired' },
     });
-    writeFileSync(
-      qoderBin,
-      `#!/bin/sh\nprintf '%s\\n' '${qoderErrorLine}'\nexit 0\n`,
-      'utf8',
+    await withFakeAgent(
+      'qodercli',
+      `console.log(${JSON.stringify(qoderErrorLine)});\nprocess.exit(0);\n`,
+      async () => {
+        const createResponse = await fetch(`${baseUrl}/api/runs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agentId: 'qoder',
+            message: 'hello',
+          }),
+        });
+        expect(createResponse.status).toBe(202);
+        const { runId } = await createResponse.json() as { runId: string };
+
+        const eventsController = new AbortController();
+        const eventsResponse = await fetch(`${baseUrl}/api/runs/${runId}/events`, {
+          signal: eventsController.signal,
+        });
+        const eventsBody = await readSseUntil(eventsResponse, 'event: error');
+        eventsController.abort();
+        const statusBody = await waitForRunStatus(baseUrl, runId);
+
+        expect(eventsBody).toContain('event: error');
+        expect(eventsBody).toContain('Qoder authentication expired');
+        expect(eventsBody).not.toContain('event: agent\\ndata: {"type":"error"');
+        expect(statusBody.status).toBe('failed');
+      },
     );
-    chmodSync(qoderBin, 0o755);
-    process.env.PATH = binDir;
-
-    const createResponse = await fetch(`${baseUrl}/api/runs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        agentId: 'qoder',
-        message: 'hello',
-      }),
-    });
-    expect(createResponse.status).toBe(202);
-    const { runId } = await createResponse.json() as { runId: string };
-
-    const eventsController = new AbortController();
-    const eventsResponse = await fetch(`${baseUrl}/api/runs/${runId}/events`, {
-      signal: eventsController.signal,
-    });
-    const eventsBody = await readSseUntil(eventsResponse, 'event: error');
-    eventsController.abort();
-    const statusBody = await waitForRunStatus(baseUrl, runId);
-
-    expect(eventsBody).toContain('event: error');
-    expect(eventsBody).toContain('Qoder authentication expired');
-    expect(eventsBody).not.toContain('event: agent\\ndata: {"type":"error"');
-    expect(statusBody.status).toBe('failed');
   });
 
   it('fails Qoder runs when the result reports is_error with exit code 0', async () => {
-    const binDir = mkdtempSync(join(tmpdir(), 'od-qoder-bin-'));
-    tempDirs.push(binDir);
-    const qoderBin = join(binDir, 'qodercli');
     const qoderResultLine = JSON.stringify({
       type: 'result',
       subtype: 'error',
@@ -219,39 +212,37 @@ process.exit(0);
         output_tokens: 1,
       },
     });
-    writeFileSync(
-      qoderBin,
-      `#!/bin/sh\nprintf '%s\\n' '${qoderResultLine}'\nexit 0\n`,
-      'utf8',
+    await withFakeAgent(
+      'qodercli',
+      `console.log(${JSON.stringify(qoderResultLine)});\nprocess.exit(0);\n`,
+      async () => {
+        const createResponse = await fetch(`${baseUrl}/api/runs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            agentId: 'qoder',
+            message: 'hello',
+          }),
+        });
+        expect(createResponse.status).toBe(202);
+        const { runId } = await createResponse.json() as { runId: string };
+
+        const eventsController = new AbortController();
+        const eventsResponse = await fetch(`${baseUrl}/api/runs/${runId}/events`, {
+          signal: eventsController.signal,
+        });
+        const eventsBody = await readSseUntil(eventsResponse, 'event: error');
+        eventsController.abort();
+        const statusBody = await waitForRunStatus(baseUrl, runId);
+
+        expect(eventsBody).toContain('event: agent');
+        expect(eventsBody).toContain('"type":"usage"');
+        expect(eventsBody).toContain('"isError":true');
+        expect(eventsBody).toContain('event: error');
+        expect(eventsBody).toContain('Qoder run failed: tool_use_failed');
+        expect(statusBody.status).toBe('failed');
+      },
     );
-    chmodSync(qoderBin, 0o755);
-    process.env.PATH = binDir;
-
-    const createResponse = await fetch(`${baseUrl}/api/runs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        agentId: 'qoder',
-        message: 'hello',
-      }),
-    });
-    expect(createResponse.status).toBe(202);
-    const { runId } = await createResponse.json() as { runId: string };
-
-    const eventsController = new AbortController();
-    const eventsResponse = await fetch(`${baseUrl}/api/runs/${runId}/events`, {
-      signal: eventsController.signal,
-    });
-    const eventsBody = await readSseUntil(eventsResponse, 'event: error');
-    eventsController.abort();
-    const statusBody = await waitForRunStatus(baseUrl, runId);
-
-    expect(eventsBody).toContain('event: agent');
-    expect(eventsBody).toContain('"type":"usage"');
-    expect(eventsBody).toContain('"isError":true');
-    expect(eventsBody).toContain('event: error');
-    expect(eventsBody).toContain('Qoder run failed: tool_use_failed');
-    expect(statusBody.status).toBe('failed');
   });
 });
 
@@ -302,6 +293,17 @@ describe('chat prompt helpers', () => {
     expect(prompt.match(/## Codex built-in imagegen override/g)).toHaveLength(1);
   });
 
+  it('defaults enabled research without an explicit query to the current message', () => {
+    const prompt = resolveResearchCommandContract(
+      { enabled: true },
+      'EV market 2025 trends',
+    );
+
+    expect(prompt).toContain('Canonical query for this run:');
+    expect(prompt).toContain('EV market 2025 trends');
+    expect(prompt).toContain('the first tool action must be the research command');
+  });
+
   it('resolves only the narrow Codex generated_images allowlist for known gpt-image image projects', () => {
     expect(
       resolveCodexGeneratedImagesDir(
@@ -310,7 +312,7 @@ describe('chat prompt helpers', () => {
         { CODEX_HOME: '/tmp/custom-codex-home' },
         '/home/tester',
       ),
-    ).toBe('/tmp/custom-codex-home/generated_images');
+    ).toBe(resolve('/tmp/custom-codex-home/generated_images'));
 
     expect(
       resolveCodexGeneratedImagesDir(

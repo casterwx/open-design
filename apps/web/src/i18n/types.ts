@@ -1,11 +1,12 @@
 // Supported UI locales. Adding a new locale requires creating a new
 // dictionary in `./locales/` and registering it in `./index.tsx`.
-export type Locale = 'en' | 'de' | 'zh-CN' | 'zh-TW' | 'pt-BR' | 'es-ES' | 'ru' | 'fa' | 'ar' | 'ja' | 'ko' | 'pl' | 'hu' | 'fr' | 'uk' | 'tr';
+export type Locale = 'en' | 'id' | 'de' | 'zh-CN' | 'zh-TW' | 'pt-BR' | 'es-ES' | 'ru' | 'fa' | 'ar' | 'ja' | 'ko' | 'pl' | 'hu' | 'fr' | 'uk' | 'tr';
 
-export const LOCALES: Locale[] = ['en', 'de', 'zh-CN', 'zh-TW', 'pt-BR', 'es-ES', 'ru', 'fa', 'ar', 'ja', 'ko', 'pl', 'hu', 'fr', 'uk', 'tr'];
+export const LOCALES: Locale[] = ['en', 'id', 'de', 'zh-CN', 'zh-TW', 'pt-BR', 'es-ES', 'ru', 'fa', 'ar', 'ja', 'ko', 'pl', 'hu', 'fr', 'uk', 'tr'];
 
 export const LOCALE_LABEL: Record<Locale, string> = {
   'en': 'English',
+  'id': 'Bahasa Indonesia',
   'de': 'Deutsch',
   'zh-CN': '简体中文',
   'zh-TW': '繁體中文',
@@ -567,6 +568,9 @@ export interface Dict {
   'preview.fullscreen': string;
   'preview.closeTitle': string;
   'preview.loading': string;
+  'preview.errorTitle': string;
+  'preview.errorBody': string;
+  'preview.retry': string;
   'preview.showSidebar': string;
   'preview.hideSidebar': string;
 
@@ -581,6 +585,8 @@ export interface Dict {
   'workspace.showChat': string;
   'workspace.closeTab': string;
   'workspace.deleteFileConfirm': string;
+  'workspace.deleteSelectedFilesConfirm': string;
+  'workspace.deleteSelectedFilesPartial': string;
   'workspace.openFromDesignFiles': string;
   'workspace.designFilesLink': string;
   'workspace.loadingSketch': string;
@@ -599,6 +605,7 @@ export interface Dict {
   'designFiles.openInTab': string;
   'designFiles.download': string;
   'designFiles.downloadSelected': string;
+  'designFiles.deleteSelected': string;
   'designFiles.clearSelection': string;
   'designFiles.selectAll': string;
   'designFiles.dropTitle': string;
@@ -774,6 +781,12 @@ export interface Dict {
   'liveArtifact.refresh.statusReady': string;
   'liveArtifact.refresh.statusSucceeded': string;
   'liveArtifact.refresh.statusFailed': string;
+  'fileViewer.deployProviderLabel': string;
+  'fileViewer.vercelProvider': string;
+  'fileViewer.cloudflarePagesProvider': string;
+  'fileViewer.deployToProvider': string;
+  'fileViewer.redeployToProvider': string;
+  'fileViewer.deployingToProvider': string;
   'fileViewer.deployToVercel': string;
   'fileViewer.redeployToVercel': string;
   'fileViewer.deployingToVercel': string;
@@ -786,16 +799,44 @@ export interface Dict {
   'fileViewer.vercelTokenPlaceholder': string;
   'fileViewer.vercelTokenReuseHint': string;
   'fileViewer.vercelTokenRequired': string;
+  'fileViewer.cloudflareApiToken': string;
+  'fileViewer.cloudflareApiTokenGetLink': string;
+  'fileViewer.cloudflareApiTokenPlaceholder': string;
+  'fileViewer.cloudflareApiTokenReuseHint': string;
+  'fileViewer.cloudflareApiTokenRequired': string;
+  'fileViewer.cloudflareApiTokenScopeHint': string;
   'fileViewer.vercelTeamId': string;
   'fileViewer.vercelTeamSlug': string;
+  'fileViewer.cloudflareAccountId': string;
+  'fileViewer.cloudflareAccountIdHint': string;
+  'fileViewer.cloudflareAccountIdRequired': string;
+  'fileViewer.cloudflareZoneLabel': string;
+  'fileViewer.cloudflareZonePlaceholder': string;
+  'fileViewer.cloudflareZoneRequired': string;
+  'fileViewer.cloudflareZonesLoading': string;
+  'fileViewer.cloudflareZonesRefresh': string;
+  'fileViewer.cloudflareZonesLoadFailed': string;
+  'fileViewer.cloudflareZonesEmpty': string;
+  'fileViewer.cloudflareDomainPrefixLabel': string;
+  'fileViewer.cloudflareDomainPrefixPlaceholder': string;
+  'fileViewer.cloudflareDomainPrefixInvalid': string;
+  'fileViewer.cloudflareHostnamePreview': string;
+  'fileViewer.cloudflareCustomDomainHint': string;
+  'fileViewer.cloudflarePagesDevLinkLabel': string;
+  'fileViewer.cloudflareCustomDomainLinkLabel': string;
   'fileViewer.optional': string;
   'fileViewer.vercelPreviewOnly': string;
+  'fileViewer.cloudflarePagesPreviewHint': string;
   'fileViewer.savingConfig': string;
   'fileViewer.deployConfigSaveFailed': string;
   'fileViewer.deployFailed': string;
+  'fileViewer.deployProviderConfigSaveFailed': string;
+  'fileViewer.deployProviderFailed': string;
   'fileViewer.deployResultLabel': string;
+  'fileViewer.deployLinkReady': string;
   'fileViewer.deployLinkPreparingLabel': string;
   'fileViewer.deployLinkDelayed': string;
+  'fileViewer.deployLinkFailed': string;
   'fileViewer.deployLinkProtectedLabel': string;
   'fileViewer.deployLinkProtected': string;
   'fileViewer.retryLink': string;
@@ -995,6 +1036,8 @@ export interface Dict {
   'pet.slashPetTuck': string;
   'pet.slashHatch': string;
   'pet.slashHatchArg': string;
+  'pet.slashSearch': string;
+  'pet.slashSearchArg': string;
   // Recently-hatched section in pet settings
   'pet.codexTitle': string;
   'pet.codexSubtitle': string;
