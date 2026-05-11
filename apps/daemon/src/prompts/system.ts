@@ -34,6 +34,8 @@ import { DISCOVERY_AND_PHILOSOPHY } from './discovery.js';
 import { DECK_FRAMEWORK_DIRECTIVE } from './deck-framework.js';
 import { MEDIA_GENERATION_CONTRACT } from './media-contract.js';
 import { IMAGE_MODELS } from '../media-models.js';
+import { renderPanelPrompt } from './panel.js';
+import { defaultCritiqueConfig, type CritiqueConfig } from '@open-design/contracts/critique';
 
 type ProjectMetadata = {
   kind?: string;
@@ -79,6 +81,7 @@ export const BASE_SYSTEM_PROMPT = OFFICIAL_DESIGNER_PROMPT;
 export interface ComposeInput {
   agentId?: string | null | undefined;
   includeCodexImagegenOverride?: boolean | undefined;
+  streamFormat?: string | undefined;
   skillBody?: string | undefined;
   skillName?: string | undefined;
   skillMode?:
@@ -99,6 +102,12 @@ export interface ComposeInput {
   // (letter-spacing, accent caps, anti-slop) cover everything below.
   craftBody?: string | undefined;
   craftSections?: string[] | undefined;
+  // Markdown built from the user's auto-memory store
+  // (<dataDir>/memory/*.md). Folded in before the active design system so
+  // tone/voice/preferences extracted from past chats win over the
+  // built-in identity charter but still defer to the brand's hard tokens
+  // and the active skill's workflow. Empty/undefined skips the block.
+  memoryBody?: string | undefined;
   // Project-level metadata captured by the new-project panel. Drives the
   // agent's understanding of artifact kind, fidelity, speaker-notes intent
   // and animation intent. Missing fields here are exactly what the
@@ -108,6 +117,26 @@ export interface ComposeInput {
   // Snapshot of HTML files that the agent should treat as a starting
   // reference rather than a fixed deliverable.
   template?: ProjectTemplate | undefined;
+  // When present and enabled, the Critique Theater protocol addendum is
+  // concatenated to the end of the composed prompt. Omitting this field
+  // (or passing cfg.enabled === false) preserves legacy behavior unchanged.
+  critique?: CritiqueConfig | undefined;
+  // Brand name and DESIGN.md body. Required when critique is enabled;
+  // ignored when critique is disabled or omitted.
+  critiqueBrand?: { name: string; design_md: string } | undefined;
+  // Skill identifier. Required when critique is enabled;
+  // ignored when critique is disabled or omitted.
+  critiqueSkill?: { id: string } | undefined;
+  // External MCP servers the daemon already holds a valid OAuth Bearer
+  // token for at spawn time. We surface the list to the model so it does
+  // NOT chase Claude Code's synthetic `*_authenticate` /
+  // `*_complete_authentication` tools that get injected when the HTTP
+  // transport's first connect transiently flips a server into
+  // needs-auth state — the Bearer is in `.mcp.json`, the real tools are
+  // available, and burning a turn on a redundant OAuth dance just
+  // confuses the user.
+  connectedExternalMcp?: ReadonlyArray<{ id: string; label?: string | undefined }>
+    | undefined;
 }
 
 export function composeSystemPrompt({
@@ -120,18 +149,45 @@ export function composeSystemPrompt({
   designSystemTitle,
   craftBody,
   craftSections,
+  memoryBody,
   metadata,
   template,
+  critique,
+  critiqueBrand,
+  critiqueSkill,
+  connectedExternalMcp,
+  streamFormat,
 }: ComposeInput): string {
   // Discovery + philosophy goes FIRST so its hard rules ("emit a form on
   // turn 1", "branch on brand on turn 2", "TodoWrite on turn 3", run
   // checklist + critique before <artifact>) win precedence over softer
   // wording later in the official base prompt.
-  const parts: string[] = [
+  const parts: string[] = [];
+
+  // API/BYOK mode (streamFormat === 'plain'): mirrors the same fix from
+  // `@open-design/contracts`'s composer. The daemon hits this path for
+  // any plain-stream adapter (e.g. DeepSeek), so without pinning the
+  // override above DISCOVERY_AND_PHILOSOPHY here too, those daemon
+  // agents still emit the `<todo-list>` / `[读取 X]` pseudo-tool
+  // markup described in #313. Keep the wording byte-identical to the
+  // contracts copy so both code paths produce the same observable
+  // behaviour.
+  if (streamFormat === 'plain') {
+    parts.push(API_MODE_OVERRIDE);
+    parts.push('\n\n---\n\n');
+  }
+
+  parts.push(
     DISCOVERY_AND_PHILOSOPHY,
     '\n\n---\n\n# Identity and workflow charter (background)\n\n',
     BASE_SYSTEM_PROMPT,
-  ];
+  );
+
+  if (memoryBody && memoryBody.trim().length > 0) {
+    parts.push(
+      `\n\n## Personal memory (auto-extracted from past chats)\n\nThe following facts have been sedimented from this user's previous conversations and edited in the settings panel. Treat them as preferences and context, NOT hard rules: when they collide with the active design system tokens, the brand wins; when they collide with the active skill's workflow, the skill wins. They are still authoritative for tone, voice, terminology, and what the user already told you about themselves and their goals — never re-ask the user about something already captured here.\n\n${memoryBody.trim()}`,
+    );
+  }
 
   if (designSystemBody && designSystemBody.trim().length > 0) {
     parts.push(
@@ -203,7 +259,99 @@ export function composeSystemPrompt({
     }
   }
 
+  // Critique Theater addendum. When cfg.enabled is true the panel protocol
+  // is pinned last so it overrides any softer critique wording earlier in the
+  // stack. When disabled (the default) this block is a no-op so no consumer
+  // needs to opt in.
+  //
+  // The panel block requires <ARTIFACT mime="text/html"> inside <CRITIQUE_RUN>,
+  // which conflicts with MEDIA_GENERATION_CONTRACT (image/video/audio surfaces
+  // explicitly forbid HTML output). Skip the addendum on media surfaces so
+  // the critique flag is a no-op there until a media-aware panel template
+  // lands.
+  const cfg = critique ?? defaultCritiqueConfig();
+  if (cfg.enabled && critiqueBrand && critiqueSkill && !isMediaSurface) {
+    parts.push('\n\n' + renderPanelPrompt({ cfg, brand: critiqueBrand, skill: critiqueSkill }));
+  }
+
+  const mcpDirective = renderConnectedExternalMcpDirective(connectedExternalMcp);
+  if (mcpDirective) parts.push(mcpDirective);
+
   return parts.join('');
+}
+
+/**
+ * Top-anchored override for plain-stream daemon agents (#313). Mirrors
+ * the contracts-package copy byte-for-byte; see that file for the full
+ * rationale. Pinning it at the absolute top of the composed prompt is
+ * what beats the discovery layer's own "these override anything later"
+ * header — the old bottom-appended `## API mode rule` lost that
+ * precedence war and let `<todo-list>` / `[读取 X]` pseudo-tool markup
+ * leak into the chat.
+ */
+const API_MODE_OVERRIDE = `# API mode — no tools available (read first — overrides every rule below)
+
+You are running through a plain Messages API. **No tools are wired through to you.** \`TodoWrite\`, \`Read\`, \`Write\`, \`Edit\`, \`Bash\`, and \`WebFetch\` are unavailable — calls to them will not execute and will not render in the UI.
+
+Every later instruction in this prompt that tells you to "call TodoWrite", "run Bash", "read via Read", or otherwise invoke a tool is describing the daemon-mode workflow. In this API run those instructions are **overridden** — do not attempt them and do not pretend you did.
+
+**Forbidden output:**
+- Pseudo-tool markup such as \`<todo-list>...</todo-list>\`, \`<tool-call>\`, or invented XML wrappers around a plan.
+- Fake-protocol prose such as \`[读取 template.html ...]\`, \`[读取 layouts.md ...]\`, \`[正在调用 TodoWrite ...]\`, or any \`[doing X]\` placeholder narrating a tool you cannot run.
+- Statements like "I'll call TodoWrite to track this" or "let me read the skill file first" — there is no TodoWrite and no Read in this run.
+
+**Allowed output:**
+- Plain chat prose to the user (in their language). State your plan as prose — a short numbered list in markdown is fine; it just must not be wrapped in \`<todo-list>\` or claim to be a tool call.
+- A final \`<artifact type="text/html">...</artifact>\` block containing a complete \`<!doctype html>\` document when the brief is ready to deliver.
+- \`<question-form>\` blocks for discovery on turn 1, exactly as the rules below describe — question-form is markup the UI parses, not a tool call.
+
+If the rules below tell you to plan with TodoWrite, write the plan as prose instead. If they tell you to read skill side files before writing, describe in one sentence which patterns/conventions you're going to apply and proceed. If they tell you to run brand-spec extraction via Bash + Read + WebFetch, ask the user the missing brand questions in the discovery form instead.`;
+
+// Defense-in-depth against Claude Code's synthetic OAuth tools.
+//
+// When Claude Code's built-in HTTP MCP transport gets a 401 on its first
+// initialize (transient propagation lag, edge cache miss, header
+// re-canonicalization quirk, etc.), it injects two synthetic tools per
+// server — `mcp__<server>__authenticate` and
+// `mcp__<server>__complete_authentication` — that drive a per-process
+// OAuth dance with a `localhost:<random>/callback` redirect_uri. That
+// listener dies with the agent process, so the round-trip never
+// completes, and meanwhile the model burns a turn pasting an
+// unreachable URL into the chat. By the time the user is back, our
+// daemon-issued Bearer is already in `.mcp.json` and the real tools
+// (`generate_image`, `models_explore`, …) are reachable on the next
+// turn — but the model doesn't know that and keeps escalating the
+// fake auth flow.
+//
+// The fix is to tell the model up front: these specific servers are
+// already authenticated by the daemon, do NOT call any
+// `*_authenticate` / `*_complete_authentication` tool for them. If
+// the real tools really are missing, surface that as a separate
+// failure instead of pivoting to the synthetic flow.
+function renderConnectedExternalMcpDirective(
+  connectedExternalMcp:
+    | ReadonlyArray<{ id: string; label?: string | undefined }>
+    | undefined,
+): string {
+  if (!connectedExternalMcp || connectedExternalMcp.length === 0) return '';
+  const lines = connectedExternalMcp
+    .map((s) => {
+      const id = typeof s?.id === 'string' ? s.id.trim() : '';
+      if (!id) return null;
+      const label = typeof s?.label === 'string' && s.label.trim() ? s.label.trim() : id;
+      return `- \`${id}\`${label !== id ? ` (${label})` : ''}`;
+    })
+    .filter((line): line is string => typeof line === 'string');
+  if (lines.length === 0) return '';
+  return [
+    '\n\n---\n\n',
+    '## External MCP servers — already authenticated\n\n',
+    'The following external MCP servers are already authenticated for this run via an OAuth Bearer token the daemon injected into `.mcp.json`. You can call their real tools directly:\n\n',
+    lines.join('\n'),
+    '\n\n',
+    '**Do NOT call any tool whose name matches `mcp__<server>__authenticate` or `mcp__<server>__complete_authentication` for the servers above.** Those are synthetic fallback tools Claude Code exposes when its first HTTP connect briefly flipped the server into a needs-auth state. The flow they drive (a `localhost:<random>/callback` redirect) cannot complete in this environment, and the real tools (e.g. `generate_image`, `models_explore`, `balance`, …) are already reachable.\n\n',
+    'If a real tool actually fails with an auth-related error, report the exact tool name and error text and stop — the user will reconnect the server in Settings → External MCP. Do not retry by invoking any `*_authenticate` tool.\n',
+  ].join('');
 }
 
 const CODEX_IMAGEGEN_MODEL_IDS = new Set(
@@ -497,6 +645,14 @@ function derivePreflight(skillBody: string): string {
   if (/references\/themes\.md/.test(skillBody)) refs.push('`references/themes.md`');
   if (/references\/components\.md/.test(skillBody)) refs.push('`references/components.md`');
   if (/references\/checklist\.md/.test(skillBody)) refs.push('`references/checklist.md`');
+  // The hyperframes skill ships an html-in-canvas reference next to the
+  // VFX catalog blocks. The chat handler at server.ts:4138 routes through
+  // this composer (not the contracts copy), so the case must live here
+  // too — otherwise live agent runs miss the preflight directive even
+  // when the skill body explicitly lists the file.
+  if (/references\/html-in-canvas\.md|html-in-canvas\.md/.test(skillBody)) {
+    refs.push('`references/html-in-canvas.md`');
+  }
   if (refs.length === 0) return '';
   return ` **Pre-flight (do this before any other tool):** Read ${refs.join(', ')} via the path written in the skill-root preamble. The seed template defines the class system you'll paste into; the layouts file is the only acceptable source of section/screen/slide skeletons; the checklist is your P0/P1/P2 gate before emitting \`<artifact>\`. Skipping this step is the #1 reason output regresses to generic AI-slop.`;
 }

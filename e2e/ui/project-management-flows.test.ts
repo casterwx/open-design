@@ -52,6 +52,21 @@ test.beforeEach(async ({ page }) => {
     );
   }, STORAGE_KEY);
 
+  await page.route('**/api/app-config', async (route) => {
+    await route.fulfill({
+      json: {
+        config: {
+          onboardingCompleted: true,
+          agentId: 'mock',
+          skillId: null,
+          designSystemId: null,
+          agentModels: {},
+          agentCliEnv: {},
+        },
+      },
+    });
+  });
+
   await page.route('**/api/agents', async (route) => {
     await route.fulfill({
       json: {
@@ -125,10 +140,12 @@ test('design system multi-select stores primary and inspiration metadata', async
   await page.goto('/');
   await page.getByTestId('new-project-tab-prototype').click();
   await page.getByTestId('new-project-name').fill('Design system multi select metadata');
+  await expect(page.getByTestId('design-system-trigger')).toContainText('Nexu Soft Tech');
 
   await page.getByTestId('design-system-trigger').click();
-  await page.getByRole('tab', { name: /multi/i }).click();
-  await page.getByRole('option', { name: /Nexu Soft Tech/i }).click();
+  const multiTab = page.getByRole('tab', { name: /multi/i });
+  await multiTab.click();
+  await expect(multiTab).toHaveAttribute('aria-selected', 'true');
   await page.getByRole('option', { name: /Editorial Noir/i }).click();
   await page.getByRole('option', { name: /Data Mist/i }).click();
 
@@ -316,7 +333,7 @@ test('home designs search filters projects and recovers from no results', async 
   await expect(homeDesignCard(page, betaName)).toBeVisible();
 });
 
-test('change pet opens pet settings and saves a custom companion', async ({ page }) => {
+test('change pet opens pet settings and updates the custom companion draft', async ({ page }) => {
   await seedAdoptedPet(page);
   await page.route('**/api/codex-pets', async (route) => {
     await route.fulfill({ json: { pets: [], rootDir: '' } });
@@ -332,7 +349,7 @@ test('change pet opens pet settings and saves a custom companion', async ({ page
 
   const dialog = page.getByRole('dialog');
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole('heading', { name: 'Pets' })).toBeVisible();
+  await expect(dialog.getByRole('heading', { level: 3, name: 'Pets' })).toBeVisible();
 
   await dialog.getByRole('tab', { name: 'Custom' }).click();
   const customPanel = dialog.locator('.pet-custom');
@@ -341,26 +358,51 @@ test('change pet opens pet settings and saves a custom companion', async ({ page
   await customPanel.getByLabel('Name').fill('QA Turtle');
   await customPanel.getByLabel('Glyph').fill('🐢');
   await customPanel.getByLabel('Greeting').fill('Shell yeah, tests are green.');
-  await expect(customPanel.getByRole('button', { name: /adopted/i })).toBeVisible();
+  await expect(customPanel.getByText('QA Turtle')).toBeVisible();
+  await expect(customPanel.getByText('Shell yeah, tests are green.')).toBeVisible();
 
-  await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click();
   await expect(dialog).toHaveCount(0);
-  await expect(page.locator('.pet-overlay .pet-sprite')).toHaveAttribute(
-    'aria-label',
-    /QA Turtle/i,
+});
+
+test('project actions toolbar enables Continue in CLI after DESIGN.md and surfaces stale provenance fallback', async ({ page }) => {
+  await page.goto('/');
+  await createProject(page, `Project actions toolbar flow ${Date.now()}`);
+  await expectWorkspaceReady(page);
+
+  await expect(page.getByRole('button', { name: 'Finalize design package' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Continue in CLI' })).toBeDisabled();
+  await expect(page.locator('.project-actions-disabled-hint')).toContainText(
+    'Finalize the design package first.',
   );
 
-  const petConfig = await readPetConfig(page);
-  expect(petConfig).toMatchObject({
-    adopted: true,
-    enabled: true,
-    petId: 'custom',
-    custom: {
-      name: 'QA Turtle',
-      glyph: '🐢',
-      greeting: 'Shell yeah, tests are green.',
-    },
-  });
+  const { projectId } = getProjectContextFromUrl(page);
+  await seedProjectFile(page, projectId, 'DESIGN.md', malformedProvenanceDesignMd());
+
+  await page.reload();
+  await expectWorkspaceReady(page);
+
+  const continueButton = page.getByRole('button', { name: 'Continue in CLI' });
+  await expect(continueButton).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Re-finalize (spec is stale)' })).toBeVisible();
+  await expect(page.locator('.project-actions-chip')).toContainText(
+    'Spec freshness unknown — regenerate to refresh signal',
+  );
+
+  const expectedDir = await fetchResolvedProjectDir(page, projectId);
+  await continueButton.click();
+
+  const toast = page.locator('.od-toast');
+  await expect(toast).toBeVisible();
+  if (expectedDir) {
+    await expect(toast).toContainText(
+      `Open your terminal at ${expectedDir}, run \`claude\`, and paste the prompt.`,
+    );
+  } else {
+    await expect(toast).toContainText(
+      'Working directory unavailable. Update the daemon to enable Continue in CLI.',
+    );
+  }
 });
 
 async function createProject(
@@ -464,22 +506,6 @@ async function seedAdoptedPet(page: Page) {
   }, STORAGE_KEY);
 }
 
-async function readPetConfig(page: Page) {
-  return page.evaluate((key) => {
-    const raw = window.localStorage.getItem(key);
-    return raw ? JSON.parse(raw).pet : null;
-  }, STORAGE_KEY) as Promise<{
-    adopted: boolean;
-    enabled: boolean;
-    petId: string;
-    custom: {
-      name: string;
-      glyph: string;
-      greeting: string;
-    };
-  } | null>;
-}
-
 async function fetchCurrentProject(page: Page) {
   const { projectId } = getProjectContextFromUrl(page);
   const response = await page.request.get(`/api/projects/${projectId}`);
@@ -503,6 +529,31 @@ async function listProjectFiles(page: Page, projectId: string) {
   return body.files;
 }
 
+async function seedProjectFile(
+  page: Page,
+  projectId: string,
+  name: string,
+  content: string,
+) {
+  const response = await page.request.post(`/api/projects/${projectId}/files`, {
+    data: { name, content },
+  });
+  expect(response.ok()).toBeTruthy();
+}
+
+async function fetchResolvedProjectDir(
+  page: Page,
+  projectId: string,
+): Promise<string | null> {
+  const response = await page.request.get(`/api/projects/${projectId}`);
+  expect(response.ok()).toBeTruthy();
+  const body = (await response.json()) as {
+    resolvedDir?: string | null;
+    project?: { metadata?: { baseDir?: string | null } };
+  };
+  return body.resolvedDir ?? body.project?.metadata?.baseDir ?? null;
+}
+
 function getProjectContextFromUrl(page: Page) {
   const url = new URL(page.url());
   const [, projectId] = url.pathname.match(/\/projects\/([^/]+)/) ?? [];
@@ -512,6 +563,19 @@ function getProjectContextFromUrl(page: Page) {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function malformedProvenanceDesignMd(): string {
+  return `# DESIGN.md
+
+## Provenance
+
+- Project ID: qa-project
+- Design system: nexu-soft-tech
+- Current artifact: mock-artifact.html
+- Transcript message count: 7
+- Generated UTC timestamp: not-a-real-date
+`;
 }
 
 function skillSummary(

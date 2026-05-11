@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { posix } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
@@ -37,6 +38,7 @@ function makeConfig(): ToolPackConfig {
         namespaceBaseRoot: "/work/.tmp/tools-pack/runtime/linux/namespaces",
         namespaceRoot: "/work/.tmp/tools-pack/runtime/linux/namespaces/default",
       },
+      cacheRoot: "/work/.tmp/tools-pack/cache",
       toolPackRoot: "/work/.tmp/tools-pack",
     },
     silent: true,
@@ -65,10 +67,10 @@ describe("buildDockerArgs", () => {
 
   it("mounts docker home and electron caches under .tmp/tools-pack/.docker-*", () => {
     const args = buildDockerArgs(makeConfig(), { uid: 1000, gid: 1000 });
-    expect(args).toContain(`${join("/work/.tmp/tools-pack", ".docker-home")}:/home/builder`);
-    expect(args).toContain(`${join("/work/.tmp/tools-pack", ".docker-cache", "electron")}:/home/builder/.cache/electron`);
+    expect(args).toContain(`${posix.join("/work/.tmp/tools-pack", ".docker-home")}:/home/builder`);
+    expect(args).toContain(`${posix.join("/work/.tmp/tools-pack", ".docker-cache", "electron")}:/home/builder/.cache/electron`);
     expect(args).toContain(
-      `${join("/work/.tmp/tools-pack", ".docker-cache", "electron-builder")}:/home/builder/.cache/electron-builder`,
+      `${posix.join("/work/.tmp/tools-pack", ".docker-cache", "electron-builder")}:/home/builder/.cache/electron-builder`,
     );
   });
 
@@ -132,6 +134,24 @@ describe("buildDockerArgs", () => {
     const args = buildDockerArgs(makeConfig(), { uid: 1000, gid: 1000 });
     const last = args[args.length - 1];
     expect(last).not.toMatch(/--portable/);
+  });
+
+  it("forwards a shell-quoted --app-version to the inner build", () => {
+    const args = buildDockerArgs(
+      { ...makeConfig(), appVersion: "0.5.0-beta.1;echo-nope" },
+      { uid: 1000, gid: 1000 },
+    );
+    const last = args[args.length - 1];
+    expect(last).toContain("--app-version '0.5.0-beta.1;echo-nope'");
+  });
+
+  it("shell-quotes apostrophes in --app-version", () => {
+    const args = buildDockerArgs(
+      { ...makeConfig(), appVersion: "0.5.0-beta.1'quoted" },
+      { uid: 1000, gid: 1000 },
+    );
+    const last = args[args.length - 1];
+    expect(last).toContain("--app-version '0.5.0-beta.1'\\''quoted'");
   });
 });
 

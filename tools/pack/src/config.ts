@@ -20,6 +20,8 @@ export type ToolPackMacCompression = "store" | "normal" | "maximum";
 export type ToolPackWebOutputMode = "server" | "standalone";
 
 export type ToolPackCliOptions = {
+  appVersion?: string;
+  cacheDir?: string;
   containerized?: boolean;
   dir?: string;
   expr?: string;
@@ -49,10 +51,12 @@ export type ToolPackRoots = {
     namespaceBaseRoot: string;
     namespaceRoot: string;
   };
+  cacheRoot: string;
   toolPackRoot: string;
 };
 
 export type ToolPackConfig = {
+  appVersion?: string;
   containerized: boolean;
   electronBuilderCliPath: string;
   electronDistPath: string;
@@ -87,9 +91,18 @@ function resolveToolPackMacCompression(value: string | undefined): ToolPackMacCo
   throw new Error(`unsupported mac --mac-compression value: ${value}`);
 }
 
+function resolveToolPackAppVersion(value: string | undefined): string | undefined {
+  if (value == null) return undefined;
+  const normalized = value.trim();
+  if (normalized.length === 0) throw new Error("--app-version must not be empty");
+  if (/\s/.test(normalized)) throw new Error(`--app-version must not contain whitespace: ${value}`);
+  return normalized;
+}
+
 function resolveToolPackWebOutputMode(platform: ToolPackPlatform, value: string | undefined): ToolPackWebOutputMode {
-  // Standalone web output is wired for mac first; other platforms fall back to server mode until their paths are enabled.
-  if (platform !== "mac") return "server";
+  // Standalone web output is wired for desktop packaged platforms; Linux stays on
+  // the existing server output until its AppImage resource path is optimized.
+  if (platform === "linux") return "server";
   if (value == null || value.length === 0) return "standalone";
   if (value === "server" || value === "standalone") return value;
   throw new Error(`unsupported OD_WEB_OUTPUT_MODE value: ${value}`);
@@ -128,12 +141,14 @@ export function resolveToolPackConfig(
     namespace: options.namespace ?? SIDECAR_DEFAULTS.namespace,
   });
   const toolPackRoot = resolve(options.dir ?? join(WORKSPACE_ROOT, ".tmp", "tools-pack"));
+  const cacheRoot = resolve(options.cacheDir ?? join(toolPackRoot, "cache"));
   const outputRoot = join(toolPackRoot, "out");
   const outputPlatformRoot = join(outputRoot, platform);
   const outputNamespaceRoot = join(outputPlatformRoot, "namespaces", namespace);
   const runtimeNamespaceBaseRoot = join(toolPackRoot, "runtime", platform, "namespaces");
 
   return {
+    appVersion: resolveToolPackAppVersion(options.appVersion),
     containerized: options.containerized === true,
     electronBuilderCliPath: resolveElectronBuilderCliPath(),
     electronDistPath: resolveElectronDistPath(WORKSPACE_ROOT),
@@ -153,6 +168,7 @@ export function resolveToolPackConfig(
         namespaceBaseRoot: runtimeNamespaceBaseRoot,
         namespaceRoot: join(runtimeNamespaceBaseRoot, namespace),
       },
+      cacheRoot,
       toolPackRoot,
     },
     removeData: options.removeData === true,
