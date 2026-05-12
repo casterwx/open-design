@@ -43,9 +43,9 @@ jobs:
         with:
           node-version: 24
 
-      - name: Prepare stable release metadata
-        id: stable
-        run: node --experimental-strip-types ./scripts/release-stable.ts
+      # - name: Prepare stable release metadata
+      #   id: stable
+      #   run: node --experimental-strip-types ./scripts/release-stable.ts
 
   verify:
     name: Verify build (typecheck + tests)
