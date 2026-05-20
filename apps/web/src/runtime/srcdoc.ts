@@ -75,6 +75,19 @@ export function buildSrcdoc(
   return injectSrcdocTransportActivationBridge(injectSnapshotBridge(withEdit));
 }
 
+/**
+ * Build the lazy transport shell.
+ *
+ * The shell does two things:
+ *   1. Register a listener for `od:srcdoc-transport-activate` that replaces
+ *      its own document with the real artifact HTML.
+ *   2. Post `od:srcdoc-transport-ready` to the parent as soon as the listener
+ *      is installed. This `ready` signal is the only reliable way for the
+ *      host to know the listener is live; without it, the host risks posting
+ *      `activate` before the iframe's script has executed (e.g. right after a
+ *      key-driven re-mount), in which case the message is dropped and the
+ *      iframe stays stuck on the empty shell. See #2253.
+ */
 export function buildLazySrcdocTransport(): string {
   return `<!doctype html>
 <html>
@@ -89,10 +102,48 @@ export function buildLazySrcdocTransport(): string {
         document.write(data.html);
         document.close();
       });
+      try {
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'od:srcdoc-transport-ready' }, '*');
+        }
+      } catch (_) { /* sandboxed parent — host falls back to onLoad */ }
     })();</script>
   </head>
   <body></body>
 </html>`;
+}
+
+export interface SrcDocActivationInputs {
+  /** The real artifact HTML the host wants to inject into the shell. */
+  srcDoc: string;
+  /** Host is currently showing the URL-loaded iframe (srcDoc iframe is hidden). */
+  useUrlLoadPreview: boolean;
+  /** Host's render pipeline is routing through the lazy transport shell. */
+  useLazySrcDocTransport: boolean;
+  /** The shell document has loaded AND posted `od:srcdoc-transport-ready`. */
+  shellReady: boolean;
+  /** Which artifact HTML has already been pushed into this shell (dedupe). */
+  activatedHtml: string | null;
+}
+
+/**
+ * Pure decision for whether the host should now post
+ * `od:srcdoc-transport-activate` to the shell iframe.
+ *
+ * Gating on `shellReady` is the fix for #2253: without it, an activation
+ * triggered by `useUrlLoadPreview` flipping to false (e.g. opening the
+ * Tweaks palette) can fire while the iframe's shell script has not yet
+ * registered its message listener. The message is dropped, the shell stays
+ * on its empty 536-byte body, and the dedupe check then suppresses the
+ * follow-up activation from the iframe's onLoad path.
+ */
+export function canActivateSrcDocTransport(state: SrcDocActivationInputs): boolean {
+  if (!state.srcDoc) return false;
+  if (state.useUrlLoadPreview) return false;
+  if (!state.useLazySrcDocTransport) return false;
+  if (!state.shellReady) return false;
+  if (state.activatedHtml === state.srcDoc) return false;
+  return true;
 }
 
 function injectSrcdocTransportActivationBridge(doc: string): string {
@@ -909,7 +960,7 @@ function meaningfulDomFallbackTarget(el) {
 
   return true;
 }
-  function targetFrom(el, allowDomFallback){
+  function targetFrom(el, allowDomFallback, clickedEl){
     var id = el.getAttribute('data-od-id') || el.getAttribute('data-screen-label');
     var selector = annotatedSelectorFor(el);
     if (!id && allowDomFallback && meaningfulDomFallbackTarget(el)) {
@@ -922,7 +973,7 @@ function meaningfulDomFallbackTarget(el) {
     var cls = typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\\s+/).slice(0,2).join('.') : '';
     var html = '';
     try { html = (el.outerHTML || '').replace(/\\s+/g, ' ').match(/^<[^>]+>/)?.[0] || ''; } catch (_) {}
-    return {
+    var payload = {
       type: 'od:comment-target',
       elementId: id,
       selector: selector,
@@ -932,6 +983,15 @@ function meaningfulDomFallbackTarget(el) {
       htmlHint: html.slice(0, 180),
       style: styleSnapshot(el)
     };
+    if (clickedEl && clickedEl !== el) {
+      var clickedTag = clickedEl.tagName ? clickedEl.tagName.toLowerCase() : 'element';
+      var clickedCls = typeof clickedEl.className === 'string' && clickedEl.className.trim() ? '.' + clickedEl.className.trim().split(/\\s+/).slice(0,2).join('.') : '';
+      payload.clickedDescendant = {
+        label: clickedTag + clickedCls,
+        text: (clickedEl.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80)
+      };
+    }
+    return payload;
   }
   function allTargets(){
     var annotatedNodes = document.querySelectorAll('[data-od-id], [data-screen-label]');
@@ -1004,15 +1064,18 @@ function meaningfulDomFallbackTarget(el) {
     return commentEnabled && !inspectEnabled && document.querySelectorAll('[data-od-id], [data-screen-label]').length === 0;
   }
   function closestTarget(event){
-    var el = event.target;
+    var clicked = event.target;
+    var el = clicked;
     var fallback = null;
     var allowDomFallback = mode === 'picker' && canUseDomFallback();
     while (el && el !== document.documentElement) {
-      if (el.getAttribute && (el.hasAttribute('data-od-id') || el.hasAttribute('data-screen-label'))) return el;
-if (!fallback && allowDomFallback && meaningfulDomFallbackTarget(el)) fallback = el;
+      if (el.getAttribute && (el.hasAttribute('data-od-id') || el.hasAttribute('data-screen-label'))) {
+        return { target: el, clicked: clicked };
+      }
+      if (!fallback && allowDomFallback && meaningfulDomFallbackTarget(el)) fallback = el;
       el = el.parentElement;
     }
-    return fallback;
+    return fallback ? { target: fallback, clicked: clicked } : null;
   }
   function applyOverride(elementId, selector, prop, value){
     if (!elementId || !prop) return;
@@ -1123,20 +1186,20 @@ if (!fallback && allowDomFallback && meaningfulDomFallbackTarget(el)) fallback =
   function pickerActive(){ return inspectEnabled || (commentEnabled && mode === 'picker'); }
   document.addEventListener('mouseover', function(ev){
     if (!pickerActive()) return;
-    var el = closestTarget(ev);
-    if (!el) return;
-    var payload = targetFrom(el, commentEnabled && mode === 'picker' && !inspectEnabled);
+    var result = closestTarget(ev);
+    if (!result) return;
+    var payload = targetFrom(result.target, commentEnabled && mode === 'picker' && !inspectEnabled);
     if (!payload || payload.elementId === hoveredId) return;
     hoveredId = payload.elementId;
     window.parent.postMessage(Object.assign({}, payload, { type: 'od:comment-hover' }), '*');
   }, true);
   document.addEventListener('mouseout', function(ev){
     if (!pickerActive()) return;
-    var el = closestTarget(ev);
-    if (!el) return;
+    var result = closestTarget(ev);
+    if (!result) return;
     var next = ev.relatedTarget;
     while (next && next !== document.documentElement) {
-      if (next === el) return;
+      if (next === result.target) return;
       next = next.parentElement;
     }
     hoveredId = null;
@@ -1144,11 +1207,11 @@ if (!fallback && allowDomFallback && meaningfulDomFallbackTarget(el)) fallback =
   }, true);
   document.addEventListener('click', function(ev){
     if (!pickerActive()) return;
-    var el = closestTarget(ev);
-    if (el) {
+    var result = closestTarget(ev);
+    if (result) {
       ev.preventDefault();
       ev.stopPropagation();
-      var payload = targetFrom(el, commentEnabled && mode === 'picker' && !inspectEnabled);
+      var payload = targetFrom(result.target, commentEnabled && mode === 'picker' && !inspectEnabled, result.clicked);
       if (payload) window.parent.postMessage(payload, '*');
       return;
     }
@@ -1249,6 +1312,11 @@ if (!fallback && allowDomFallback && meaningfulDomFallbackTarget(el)) fallback =
 html[data-od-comment-mode] body * { cursor: crosshair !important; }
 html[data-od-inspect-mode] body * { cursor: crosshair !important; }
 html[data-od-comment-mode][data-od-comment-mode-kind="pod"] body * { cursor: cell !important; }
+/* Nested iframes (e.g. shared device frames) consume clicks in their own browsing context.
+   While picker modes are on, disable pointer events on outer-document iframes so the
+   hit target resolves to an annotated ancestor (card, shell) in this document. */
+html[data-od-comment-mode] body iframe,
+html[data-od-inspect-mode] body iframe { pointer-events: none !important; }
 </style>`;
   return injectBeforeBodyEnd(injectBeforeHeadEnd(doc, style), script);
 }
