@@ -4,9 +4,19 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { PreviewDrawOverlay } from '../../src/components/PreviewDrawOverlay';
+import { requestPreviewSnapshot } from '../../src/runtime/exports';
+
+vi.mock('../../src/runtime/exports', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/runtime/exports')>();
+  return {
+    ...actual,
+    requestPreviewSnapshot: vi.fn(async () => ({ dataUrl: 'data:image/png;base64,AAAA', w: 10, h: 10 })),
+  };
+});
 
 afterEach(() => {
   cleanup();
+  vi.mocked(requestPreviewSnapshot).mockClear();
 });
 
 describe('PreviewDrawOverlay', () => {
@@ -148,6 +158,70 @@ describe('PreviewDrawOverlay', () => {
     expect(scrollBy).toHaveBeenCalledWith({ left: 12, top: 180, behavior: 'auto' });
   });
 
+  it('uses the postMessage scroll bridge for sandboxed preview iframes', () => {
+    const { container } = render(
+      <PreviewDrawOverlay active>
+        <iframe title="preview" sandbox="allow-scripts allow-downloads" />
+      </PreviewDrawOverlay>,
+    );
+
+    const canvas = container.querySelector('canvas');
+    const iframe = container.querySelector('iframe');
+    expect(canvas).toBeTruthy();
+    expect(iframe?.contentWindow).toBeTruthy();
+
+    const postMessage = vi.fn();
+    Object.defineProperty(iframe!.contentWindow!, 'postMessage', {
+      value: postMessage,
+      configurable: true,
+    });
+
+    fireEvent.wheel(canvas!, {
+      deltaX: 8,
+      deltaY: 96,
+    });
+
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: 'od:preview-scroll-by', left: 8, top: 96 },
+      '*',
+    );
+  });
+
+  it('falls back to the scroll bridge when direct frame scroll is cross-origin blocked', () => {
+    const { container } = render(
+      <PreviewDrawOverlay active>
+        <iframe title="preview" />
+      </PreviewDrawOverlay>,
+    );
+
+    const canvas = container.querySelector('canvas');
+    const iframe = container.querySelector('iframe');
+    expect(canvas).toBeTruthy();
+    expect(iframe?.contentWindow).toBeTruthy();
+
+    const postMessage = vi.fn();
+    Object.defineProperty(iframe!.contentWindow!, 'postMessage', {
+      value: postMessage,
+      configurable: true,
+    });
+    Object.defineProperty(iframe!.contentWindow!, 'scrollBy', {
+      get() {
+        throw new DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError');
+      },
+      configurable: true,
+    });
+
+    fireEvent.wheel(canvas!, {
+      deltaX: 4,
+      deltaY: 72,
+    });
+
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: 'od:preview-scroll-by', left: 4, top: 72 },
+      '*',
+    );
+  });
+
   it('closes the draw toolbar from an explicit close button', async () => {
     const onActiveChange = vi.fn();
     const { getByRole } = render(
@@ -159,5 +233,23 @@ describe('PreviewDrawOverlay', () => {
     fireEvent.click(getByRole('button', { name: 'Close' }));
 
     expect(onActiveChange).toHaveBeenCalledWith(false);
+  });
+
+  it('snapshots the srcDoc bridge iframe, not the visible URL-load frame', async () => {
+    const snapshot = vi.mocked(requestPreviewSnapshot);
+    const { getByRole } = render(
+      <PreviewDrawOverlay active captureViewport>
+        {/* URL-load frame is the visible/active one (e.g. a deck) but has no bridge */}
+        <iframe title="url" data-od-active="true" />
+        {/* srcDoc frame is mounted but hidden; it hosts the snapshot bridge */}
+        <iframe title="srcdoc" data-od-render-mode="srcdoc" data-od-active="false" />
+      </PreviewDrawOverlay>,
+    );
+
+    fireEvent.click(getByRole('button', { name: 'Send' }));
+
+    await waitFor(() => expect(snapshot).toHaveBeenCalled());
+    const usedIframe = snapshot.mock.calls[0]?.[0] as HTMLIFrameElement;
+    expect(usedIframe.getAttribute('data-od-render-mode')).toBe('srcdoc');
   });
 });

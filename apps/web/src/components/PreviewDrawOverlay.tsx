@@ -172,6 +172,52 @@ export function PreviewDrawOverlay({
     ) ?? null;
   }
 
+  // The snapshot bridge only lives in the srcDoc transport iframe. For URL-load
+  // previews (e.g. decks) that iframe is mounted but hidden (data-od-active is on
+  // the bridgeless URL iframe), so snapshotting the *active* frame times out and
+  // capture fails. Prefer the srcDoc-render-mode frame; capture mode keeps it on
+  // full content, so it carries the bridge.
+  function snapshotHostIframe(): HTMLIFrameElement | null {
+    return (
+      wrapRef.current?.querySelector<HTMLIFrameElement>('iframe[data-od-render-mode="srcdoc"]') ??
+      activePreviewIframe()
+    );
+  }
+
+  function canTryDirectFrameScroll(iframe: HTMLIFrameElement): boolean {
+    const sandbox = iframe.getAttribute('sandbox');
+    return sandbox === null || /\ballow-same-origin\b/.test(sandbox);
+  }
+
+  function postFrameScrollBy(win: Window, left: number, top: number): boolean {
+    try {
+      win.postMessage({ type: 'od:preview-scroll-by', left, top }, '*');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function scrollPreviewIframeBy(iframe: HTMLIFrameElement, left: number, top: number): boolean {
+    const win = iframe.contentWindow;
+    if (!win) return false;
+
+    if (canTryDirectFrameScroll(iframe)) {
+      try {
+        const scrollBy = win.scrollBy;
+        if (typeof scrollBy === 'function') {
+          win.scrollBy({ left, top, behavior: 'auto' });
+          return true;
+        }
+      } catch {
+        // Sandboxed / cross-origin frames throw on Window property reads.
+        // Fall through to the postMessage bridge injected into srcDoc previews.
+      }
+    }
+
+    return postFrameScrollBy(win, left, top);
+  }
+
   function onPointerDown(e: PointerEvent) {
     if (!active || sending) return;
     (e.target as Element).setPointerCapture?.(e.pointerId);
@@ -221,10 +267,10 @@ export function PreviewDrawOverlay({
   function onCanvasWheel(e: WheelEvent<HTMLCanvasElement>) {
     if (!active || sending) return;
     const iframe = activePreviewIframe();
-    const win = iframe?.contentWindow;
-    if (!win || typeof win.scrollBy !== 'function') return;
-    e.preventDefault();
-    win.scrollBy({ left: e.deltaX, top: e.deltaY, behavior: 'auto' });
+    if (!iframe) return;
+    if (scrollPreviewIframeBy(iframe, e.deltaX, e.deltaY)) {
+      e.preventDefault();
+    }
   }
 
   function clearInk() {
@@ -335,9 +381,16 @@ export function PreviewDrawOverlay({
   }
 
   async function requestSnapshot(): Promise<{ dataUrl: string; w: number; h: number } | null> {
-    const iframe = activePreviewIframe();
+    const iframe = snapshotHostIframe();
     if (!iframe) return null;
-    return requestPreviewSnapshot(iframe);
+    // Capture mode may still be swapping the srcDoc frame to full content when
+    // the user submits, so retry with growing timeouts before giving up.
+    const timeouts = [1500, 3000, 6000];
+    for (const timeout of timeouts) {
+      const snapshot = await requestPreviewSnapshot(iframe, timeout);
+      if (snapshot) return snapshot;
+    }
+    return null;
   }
 
   function drawCaptureTarget(
