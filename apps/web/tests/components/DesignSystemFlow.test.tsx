@@ -12,6 +12,7 @@ import {
   DesignSystemCreationFlow,
   DesignSystemDetailView,
 } from '../../src/components/DesignSystemFlow';
+import { CONNECTORS_CHANGED_EVENT } from '../../src/components/connectors-events';
 import type { AppConfig, Conversation, DesignSystemDetail, Project, ProjectFile } from '../../src/types';
 import { I18nProvider } from '../../src/i18n';
 
@@ -43,15 +44,18 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../../src/components/ChatPane', () => ({
   ChatPane: ({
     error,
+    initialDraft,
     onNewConversation,
     onSend,
   }: {
     error?: string | null;
+    initialDraft?: string;
     onNewConversation?: () => void;
     onSend: (prompt: string, attachments: unknown[], commentAttachments: unknown[]) => void;
   }) => (
     <>
       {error ? <div role="alert">{error}</div> : null}
+      {initialDraft ? <div data-testid="chat-initial-draft">{initialDraft}</div> : null}
       <button
         type="button"
         data-testid="new-conversation"
@@ -447,7 +451,7 @@ describe('DesignSystemCreationFlow', () => {
     expect(mocks.patchProject).toHaveBeenCalledWith(
       project.id,
       expect.objectContaining({
-        pendingPrompt: expect.stringContaining('Do not emit `<question-form>`, "Quick brief — 30 seconds", `AskUserQuestion`'),
+        pendingPrompt: expect.stringContaining('Do not emit `<question-form>`, "Quick brief — 30 seconds"'),
       }),
     );
     expect(mocks.patchProject).toHaveBeenCalledWith(
@@ -1617,33 +1621,40 @@ describe('DesignSystemCreationFlow', () => {
     const config = {
       composio: { apiKeyConfigured: true, apiKeyTail: 'uQEg' },
     } as AppConfig;
+    const onConnectorsChanged = vi.fn();
+    window.addEventListener(CONNECTORS_CHANGED_EVENT, onConnectorsChanged);
 
-    render(
-      <DesignSystemCreationFlow
-        onBack={() => {}}
-        onCreated={() => {}}
-        config={config}
-      />,
-    );
+    try {
+      render(
+        <DesignSystemCreationFlow
+          onBack={() => {}}
+          onCreated={() => {}}
+          config={config}
+        />,
+      );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Show access methods' }));
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Connect via Composio' })).toBeTruthy());
-    expect((screen.getByPlaceholderText('https://github.com/owner/repo') as HTMLInputElement).disabled).toBe(false);
+      fireEvent.click(screen.getByRole('button', { name: 'Show access methods' }));
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Connect via Composio' })).toBeTruthy());
+      expect((screen.getByPlaceholderText('https://github.com/owner/repo') as HTMLInputElement).disabled).toBe(false);
 
-    fireEvent.click(screen.getByRole('button', { name: 'Connect via Composio' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Connect via Composio' }));
 
-    await waitFor(() => expect(mocks.connectConnector).toHaveBeenCalledWith('github'));
-    await waitFor(() => expect(screen.getByText(/Connected as qiongyu1999/i)).toBeTruthy());
-    expect(screen.queryByRole('button', { name: 'Configure' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Disconnect' })).toBeTruthy();
-    const input = screen.getByPlaceholderText('https://github.com/owner/repo') as HTMLInputElement;
-    expect(input.disabled).toBe(false);
+      await waitFor(() => expect(mocks.connectConnector).toHaveBeenCalledWith('github'));
+      await waitFor(() => expect(screen.getByText(/Connected as qiongyu1999/i)).toBeTruthy());
+      await waitFor(() => expect(onConnectorsChanged).toHaveBeenCalledTimes(1));
+      expect(screen.queryByRole('button', { name: 'Configure' })).toBeNull();
+      expect(screen.getByRole('button', { name: 'Disconnect' })).toBeTruthy();
+      const input = screen.getByPlaceholderText('https://github.com/owner/repo') as HTMLInputElement;
+      expect(input.disabled).toBe(false);
 
-    fireEvent.change(input, { target: { value: 'https://github.com/nexu-io/open-design/' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+      fireEvent.change(input, { target: { value: 'https://github.com/nexu-io/open-design/' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Add' }));
 
-    expect(screen.getByText('nexu-io/open-design')).toBeTruthy();
-    expect(input.value).toBe('');
+      expect(screen.getByText('nexu-io/open-design')).toBeTruthy();
+      expect(input.value).toBe('');
+    } finally {
+      window.removeEventListener(CONNECTORS_CHANGED_EVENT, onConnectorsChanged);
+    }
   });
 
   it('hides Composio connection ids in the connected GitHub label', async () => {
@@ -1949,6 +1960,93 @@ describe('DesignSystemCreationFlow', () => {
 });
 
 describe('DesignSystemDetailView', () => {
+  it('does not silently seed audit repair prompts into the composer after manual runs', async () => {
+    const system: DesignSystemDetail = {
+      id: 'user:acme-design-system',
+      title: 'Acme Design System',
+      category: 'Custom',
+      summary: 'Acme product workspace.',
+      swatches: [],
+      surface: 'web',
+      body: '# Acme Design System\n',
+      source: 'user',
+      status: 'draft',
+      isEditable: true,
+      projectId: 'ds-acme-design-system',
+    };
+    const project: Project = {
+      id: 'ds-acme-design-system',
+      name: 'Acme Design System',
+      skillId: null,
+      designSystemId: system.id,
+      createdAt: 1,
+      updatedAt: 1,
+      metadata: {
+        kind: 'other',
+        importedFrom: 'design-system',
+        entryFile: 'DESIGN.md',
+        sourceFileName: system.id,
+      },
+    };
+    const config: AppConfig = {
+      mode: 'daemon',
+      apiKey: '',
+      baseUrl: '',
+      model: '',
+      agentId: 'agent-1',
+      agentModels: {},
+      skillId: null,
+      designSystemId: null,
+    };
+
+    mocks.fetchDesignSystem.mockResolvedValue(system);
+    mocks.ensureDesignSystemWorkspace.mockResolvedValue({ project, files: [] });
+    mocks.listConversations.mockResolvedValue([
+      { id: 'conv-design-system', projectId: project.id, title: 'Design system', createdAt: 1, updatedAt: 1 },
+    ]);
+    mocks.fetchProjectDesignSystemPackageAudit.mockResolvedValue({
+      ok: false,
+      projectPath: '/tmp/ds',
+      filesInspected: 12,
+      errors: [{
+        severity: 'error',
+        code: 'missing_required_file',
+        message: 'README.md is missing.',
+        path: 'README.md',
+      }],
+      warnings: [],
+    });
+    mocks.streamViaDaemon.mockImplementation(async (options: {
+      handlers: { onDone: () => void };
+      onRunCreated?: (runId: string) => void;
+    }) => {
+      options.onRunCreated?.('run-design-system');
+      options.handlers.onDone();
+    });
+
+    render(
+      <DesignSystemDetailView
+        id={system.id}
+        selectedId={system.id}
+        config={config}
+        agents={[{ id: 'agent-1', name: 'OpenCode', bin: 'opencode', available: true, models: [] }]}
+        onBack={() => {}}
+        onSetDefault={() => {}}
+      />,
+    );
+
+    await screen.findByText('Acme Design System');
+    fireEvent.click(screen.getByTestId('design-system-chat-send'));
+
+    await waitFor(() => expect(mocks.fetchProjectDesignSystemPackageAudit).toHaveBeenCalledWith(project.id));
+    await waitFor(() =>
+      expect(screen.getAllByText(/Package audit found 1 error/).length).toBeGreaterThan(0),
+    );
+    expect(screen.queryByTestId('chat-initial-draft')?.textContent ?? '').not.toContain(
+      'Fix the design-system package audit findings below.',
+    );
+  });
+
   it('opens the Design Files workspace when the detail payload omits the optional source field', async () => {
     const system = {
       id: 'user:acme-design-system',

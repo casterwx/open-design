@@ -77,6 +77,17 @@ test('unanswered structured question marks project as awaiting input', () => {
   assert.deepEqual([...listProjectsAwaitingInput(db)], ['project-a']);
 });
 
+test('ask-question alias of question-form also marks project as awaiting input', () => {
+  const db = createDb();
+  const conversationId = seedProject(db, 'project-a-alias');
+
+  // <ask-question> is an accepted alias for <question-form>; an alias-form
+  // turn must mark the project awaiting input just like the canonical tag.
+  addMessage(db, conversationId, 'assistant-question', 'assistant', 'Need one choice\n<ask-question id="q1">');
+
+  assert.deepEqual([...listProjectsAwaitingInput(db)], ['project-a-alias']);
+});
+
 test('user reply after structured question clears awaiting input', () => {
   const db = createDb();
   const conversationId = seedProject(db, 'project-b');
@@ -269,6 +280,7 @@ test('conversation listing batches latest run summaries for large projects', () 
   assert.equal(preparedSql.length, 1);
   assert.equal(conversations[0]?.latestRun?.status, 'failed');
   assert.equal(conversations[0]?.latestRun?.durationMs, 75);
+  assert.equal(conversations[0]?.messageCount, 2);
 });
 
 test('only succeeded statuses are overridden by awaiting input', () => {

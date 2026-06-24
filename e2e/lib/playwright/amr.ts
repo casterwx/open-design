@@ -1,12 +1,13 @@
 import type { Page } from '@playwright/test';
 import { expect } from '@playwright/test';
+import { T } from '@/timeouts';
 
 export const STORAGE_KEY = 'open-design:config';
 export const OPEN_SETTINGS_LABEL = /Open settings|打开设置|開啟設定|Account & settings/i;
 export const SETTINGS_MENU_LABEL = /Settings|设置|設定/i;
 
 export async function waitForLoadingToClear(page: Page) {
-  await expect(page.getByText('Loading Open Design…')).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText('Loading Open Design…')).toHaveCount(0, { timeout: T.long });
 }
 
 export async function dismissPrivacyDialog(page: Page) {
@@ -31,13 +32,34 @@ export async function expectWorkspaceReady(page: Page) {
 }
 
 export async function openSettingsDialog(page: Page) {
+  await waitForLoadingToClear(page);
   await dismissPrivacyDialog(page);
-  await page.getByRole('button', { name: OPEN_SETTINGS_LABEL }).click();
-  const menu = page.getByRole('menu');
-  if (await menu.isVisible({ timeout: 1_000 }).catch(() => false)) {
-    await menu.getByRole('button', { name: SETTINGS_MENU_LABEL }).click();
+  const settingsTrigger = page.getByTestId('entry-settings-menu-trigger');
+  if (await settingsTrigger.isVisible({ timeout: 1_000 }).catch(() => false)) {
+    await settingsTrigger.click();
+  } else {
+    await page.getByRole('button', { name: OPEN_SETTINGS_LABEL }).first().click();
   }
   const dialog = page.getByRole('dialog');
+  const menu = page
+    .getByTestId('entry-settings-menu')
+    .or(page.getByRole('menu', { name: SETTINGS_MENU_LABEL }))
+    .first();
+  await expect
+    .poll(async () => {
+      if (await dialog.isVisible().catch(() => false)) return 'dialog';
+      if (await menu.isVisible().catch(() => false)) return 'menu';
+      return 'pending';
+    })
+    .not.toBe('pending');
+  if (await menu.isVisible().catch(() => false)) {
+    const settingsItem = menu
+      .getByRole('menuitem', { name: SETTINGS_MENU_LABEL })
+      .or(menu.getByRole('button', { name: SETTINGS_MENU_LABEL }))
+      .first();
+    await expect(settingsItem).toBeVisible({ timeout: 10_000 });
+    await settingsItem.click();
+  }
   await expect(dialog).toBeVisible({ timeout: 10_000 });
   return dialog;
 }

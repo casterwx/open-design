@@ -17,6 +17,7 @@
 import {
   buildManualEditBridge,
   buildManualEditBridgeStyle,
+  buildManualEditKeyboardGuard,
   MANUAL_EDIT_DISCOVERY_SELECTOR,
   MANUAL_EDIT_SOURCE_PATH_ATTR,
 } from '../edit-mode/bridge';
@@ -34,6 +35,206 @@ export type SrcdocOptions = {
   previewFocusGuard?: boolean;
 };
 
+/**
+ * Sanitize a document title string so the resulting PDF filename is accepted by
+ * Microsoft Teams. Teams rejects filenames that contain any of:
+ *   : # % & * { } \ < > ? / + | "
+ * as well as leading/trailing spaces and the prefix sequence "~$".
+ *
+ * Each disallowed character (or run of disallowed characters) is replaced with
+ * a single hyphen. The result is trimmed of leading and trailing whitespace.
+ * Titles that are already safe pass through unchanged.
+ *
+ * Invariant: the returned string contains none of the Teams-disallowed
+ * characters and has no leading or trailing spaces, and does not start
+ * with the ~$ prefix.
+ */
+export function sanitizePreviewTitle(text: string): string {
+  // Trim first so that leading whitespace cannot hide a ~$ prefix from the
+  // anchor-based check below (e.g. "  ~$Invoice" would otherwise survive).
+  let result = text.trim();
+  // Remove every leading ~$ prefix. A single replace(/^~\$/, '') is not
+  // enough when the prefix is doubled ("~$~$Doc"). Loop until stable, then
+  // re-trim in case a space followed the prefix ("~$ Invoice" → " Invoice").
+  let prev: string;
+  do {
+    prev = result;
+    result = result.replace(/^~\$/, '').trim();
+  } while (result !== prev);
+  // Replace each disallowed character (or run of them) with a single hyphen.
+  // Character class: : # % & * { } \ < > ? / + | "
+  // eslint-disable-next-line no-useless-escape
+  result = result.replace(/[:#%&*{}\\<>?/+|"]+/g, '-');
+  // Final trim to remove any spaces exposed by the substitution.
+  return result.trim();
+}
+
+/**
+ * A small set of common named non-ASCII entities that appear in real-world
+ * titles (e.g. &ccedil; → ç, &eacute; → é). Keeping this narrow avoids
+ * shipping a full HTML entity table while still preventing the "orphaned
+ * name;" garbage that results when & is stripped before entity detection.
+ * Characters produced here that are Teams-disallowed get cleaned up by the
+ * subsequent sanitizePreviewTitle pass.
+ */
+const NAMED_ENTITY_MAP: Record<string, string> = {
+  // Latin-1 letters most likely to appear in design/business titles
+  agrave: 'à', aacute: 'á', acirc: 'â', atilde: 'ã', auml: 'ä', aring: 'å',
+  aelig: 'æ', ccedil: 'ç',
+  egrave: 'è', eacute: 'é', ecirc: 'ê', euml: 'ë',
+  igrave: 'ì', iacute: 'í', icirc: 'î', iuml: 'ï',
+  eth: 'ð', ntilde: 'ñ',
+  ograve: 'ò', oacute: 'ó', ocirc: 'ô', otilde: 'õ', ouml: 'ö', oslash: 'ø',
+  ugrave: 'ù', uacute: 'ú', ucirc: 'û', uuml: 'ü',
+  yacute: 'ý', thorn: 'þ', yuml: 'ÿ',
+  Agrave: 'À', Aacute: 'Á', Acirc: 'Â', Atilde: 'Ã', Auml: 'Ä', Aring: 'Å',
+  AElig: 'Æ', Ccedil: 'Ç',
+  Egrave: 'È', Eacute: 'É', Ecirc: 'Ê', Euml: 'Ë',
+  Igrave: 'Ì', Iacute: 'Í', Icirc: 'Î', Iuml: 'Ï',
+  ETH: 'Ð', Ntilde: 'Ñ',
+  Ograve: 'Ò', Oacute: 'Ó', Ocirc: 'Ô', Otilde: 'Õ', Ouml: 'Ö', Oslash: 'Ø',
+  Ugrave: 'Ù', Uacute: 'Ú', Ucirc: 'Û', Uuml: 'Ü',
+  Yacute: 'Ý', THORN: 'Þ',
+  // Common punctuation / symbols that can appear in business document titles
+  ndash: '–', mdash: '—', lsquo: '‘', rsquo: '’',
+  ldquo: '“', rdquo: '”', hellip: '…', trade: '™', reg: '®',
+  copy: '©', deg: '°', euro: '€', pound: '£', yen: '¥',
+};
+
+/**
+ * Safe wrapper around String.fromCodePoint that returns U+FFFD for
+ * out-of-range values instead of throwing RangeError.
+ */
+function safeFromCodePoint(cp: number): string {
+  if (cp < 0 || cp > 0x10ffff) return '�';
+  return String.fromCodePoint(cp);
+}
+
+/**
+ * Decode the minimal HTML entities that browsers render in <title> text:
+ * &amp; → & , &lt; → < , &gt; → > , &quot; → " , &apos; → ' , &#N; / &#xN;
+ * Also decodes a small set of common named non-ASCII entities (e.g. &ccedil;)
+ * so they do not leave orphaned "name;" fragments after the & is sanitized.
+ * Numeric entities with out-of-range code points fall back to U+FFFD instead
+ * of throwing RangeError.
+ */
+function decodeHtmlEntitiesForTitle(encoded: string): string {
+  return encoded
+    // Named non-ASCII entities first — before the standard 5 named entities
+    // below, so &amp; still converts to & (not left as a lookup miss).
+    .replace(/&([A-Za-z]+);/g, (match, name: string) => NAMED_ENTITY_MAP[name] ?? match)
+    // Standard 5 named entities.
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    // Numeric entities — range-checked to avoid RangeError on huge code points.
+    .replace(/&#(\d+);/g, (_, n: string) => safeFromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h: string) => safeFromCodePoint(parseInt(h, 16)));
+}
+
+/**
+ * Find the character offset of the first real `<title>` tag in an HTML string
+ * that is not inside an HTML comment (`<!-- … -->`), a `<script>` block, or a
+ * `<style>` block. Returns -1 when no real title is found.
+ *
+ * The scan is O(n) over the head region. It keeps track of whether the current
+ * cursor is inside a comment / script / style and skips any `<title>` found
+ * within those contexts.
+ */
+function findRealTitleOffset(html: string, searchLimit: number): number {
+  let i = 0;
+  const limit = Math.min(html.length, searchLimit);
+  while (i < limit) {
+    // Check for HTML comment start
+    if (html.charCodeAt(i) === 60 /* < */ && html.slice(i, i + 4) === '<!--') {
+      const end = html.indexOf('-->', i + 4);
+      if (end < 0) return -1; // unclosed comment — no title after this
+      i = end + 3;
+      continue;
+    }
+    // Check for <script or <style (case-insensitive)
+    if (html.charCodeAt(i) === 60 /* < */) {
+      const tagMatch = /^<(script|style)\b/i.exec(html.slice(i, i + 20));
+      if (tagMatch) {
+        const closingTag = `</${tagMatch[1]}`;
+        const end = html.toLowerCase().indexOf(closingTag.toLowerCase(), i + tagMatch[0].length);
+        if (end < 0) return -1; // unclosed script/style — no title after this
+        const closeEnd = html.indexOf('>', end);
+        i = closeEnd >= 0 ? closeEnd + 1 : end + closingTag.length;
+        continue;
+      }
+    }
+    // Check for <title (case-insensitive)
+    if (html.charCodeAt(i) === 60 /* < */) {
+      if (/^<title[\s>]/i.test(html.slice(i, i + 8))) {
+        return i;
+      }
+    }
+    i++;
+  }
+  return -1;
+}
+
+/**
+ * Rewrite the <title> element in an HTML string so its text content is
+ * Teams-filename-safe. Only the real `<title>` in the `<head>` region is
+ * changed — `<title>` occurrences inside HTML comments, `<script>` blocks,
+ * or `<style>` blocks are left untouched.
+ *
+ * Strategy:
+ *   1. Locate the `<head>`…`</head>` region (or the area before `<body>`).
+ *   2. Within that region, scan past comments and script/style blocks to find
+ *      the first unambiguous `<title>` start tag.
+ *   3. Decode HTML entities in its text, sanitize, and splice back.
+ *
+ * Pure string operations — no DOMParser — so it works identically in Node
+ * test environments and in the browser.
+ *
+ * @public — exported for daemon-side URL-load title sanitization.
+ */
+export function sanitizeTitleInDoc(html: string): string {
+  const lower = html.toLowerCase();
+
+  // Find the end of the <head> region. Use the last </head> before <body>
+  // (mirrors injectBeforeHeadEnd logic) so we don't pick up </head> literals
+  // inside <script>/<style>.
+  const bodyStart = lower.indexOf('<body');
+  const headEnd = lower.lastIndexOf('</head>', bodyStart >= 0 ? bodyStart - 1 : lower.length - 1);
+
+  // The region to search: up to (and including) </head> if found, otherwise
+  // up to <body> if found, otherwise the entire document.
+  const searchLimit = headEnd >= 0
+    ? headEnd + 7 // include the </head> tag itself
+    : bodyStart >= 0
+      ? bodyStart
+      : html.length;
+
+  // Find the real <title> start offset, skipping comments and script/style.
+  const titleStart = findRealTitleOffset(html, searchLimit);
+  if (titleStart < 0) return html;
+
+  // Locate the end of the <title> open tag.
+  const openTagEnd = html.indexOf('>', titleStart);
+  if (openTagEnd < 0) return html;
+
+  // Locate the matching </title>.
+  const closingTagStart = html.toLowerCase().indexOf('</title>', openTagEnd + 1);
+  if (closingTagStart < 0) return html;
+  const closingTagEnd = html.indexOf('>', closingTagStart);
+  if (closingTagEnd < 0) return html;
+
+  const openTag = html.slice(titleStart, openTagEnd + 1);
+  const rawContent = html.slice(openTagEnd + 1, closingTagStart);
+  const closeTag = html.slice(closingTagStart, closingTagEnd + 1);
+
+  const decoded = decodeHtmlEntitiesForTitle(rawContent);
+  const safe = sanitizePreviewTitle(decoded);
+
+  return html.slice(0, titleStart) + openTag + safe + closeTag + html.slice(closingTagEnd + 1);
+}
+
 export function buildSrcdoc(
   html: string,
   options: SrcdocOptions = {}
@@ -50,7 +251,12 @@ export function buildSrcdoc(
   </head>
   <body>${html}</body>
 </html>`;
-  const withOdIds = annotateMissingOdIds(wrapped);
+  // Sanitize <title> text before any other transformation so that when the
+  // user prints the preview iframe (Cmd+P → Save as PDF), Chromium uses the
+  // sanitized title as the default filename — one that Microsoft Teams will
+  // accept. Only the title text changes; visible page content is untouched.
+  const withSafeTitle = sanitizeTitleInDoc(wrapped);
+  const withOdIds = annotateMissingOdIds(withSafeTitle);
   const withSourcePaths = options.editBridge ? annotateManualEditSourcePaths(withOdIds) : withOdIds;
   const withBase = options.baseHref ? injectBaseHref(withSourcePaths, options.baseHref) : withSourcePaths;
   const withShim = injectSandboxShim(withBase);
@@ -227,6 +433,24 @@ function injectSnapshotBridge(doc: string): string {
         .replace(/@font-face\\s*\\{[^}]*\\}/gi, '');
     }
   }
+  function pruneHiddenSnapshotNodes(originalRoot, cloneRoot){
+    var originals = originalRoot.querySelectorAll('*');
+    var clones = cloneRoot.querySelectorAll('*');
+    var count = Math.min(originals.length, clones.length);
+    var removals = [];
+    for (var i = 0; i < count; i++){
+      var original = originals[i];
+      var clone = clones[i];
+      if (!original || !clone || !clone.parentNode) continue;
+      var computed = window.getComputedStyle(original);
+      if (computed && (computed.display === 'none' || computed.visibility === 'hidden')) {
+        removals.push(clone);
+      }
+    }
+    for (var r = removals.length - 1; r >= 0; r--){
+      if (removals[r].parentNode) removals[r].parentNode.removeChild(removals[r]);
+    }
+  }
   function waitForImages(){
     var imgs = Array.prototype.slice.call(document.images || []);
     return Promise.all(imgs.map(function(img){
@@ -248,15 +472,44 @@ function injectSnapshotBridge(doc: string): string {
   function escapeAttribute(value){
     return String(value || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   }
+  function snapshotBackgroundColor(){
+    try {
+      var probe = window.getComputedStyle(document.body || document.documentElement);
+      var bg = probe && probe.backgroundColor || '';
+      if (!bg || bg === 'transparent' || bg === 'rgba(0, 0, 0, 0)') return '#ffffff';
+      return bg;
+    } catch (_) { return '#ffffff'; }
+  }
+  // After painting, sample the canvas: a uniform (single-color) bitmap means
+  // the foreignObject rasterizer painted nothing — Chromium frequently refuses
+  // to paint <foreignObject> HTML loaded via <img>. Treating that as an honest
+  // 'empty-render' error (instead of shipping the background-only frame) lets
+  // the host fall back / surface a real failure rather than a silent black PNG.
+  function canvasLooksBlank(ctx, cw, ch){
+    try {
+      var data = ctx.getImageData(0, 0, cw, ch).data;
+      var step = Math.max(4, Math.floor((cw * ch) / 4096)) * 4;
+      var first = null, samples = 0;
+      for (var i = 0; i + 3 < data.length; i += step){
+        samples++;
+        if (!first){ first = [data[i], data[i+1], data[i+2], data[i+3]]; continue; }
+        if (Math.abs(data[i]-first[0]) > 6 || Math.abs(data[i+1]-first[1]) > 6 ||
+            Math.abs(data[i+2]-first[2]) > 6 || Math.abs(data[i+3]-first[3]) > 6) return false;
+      }
+      return samples > 8;
+    } catch (_) { return false; }
+  }
   function renderSnapshot(id){
     var w = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
     var h = Math.max(1, window.innerHeight || document.documentElement.clientHeight || 1);
     var dpr = window.devicePixelRatio || 1;
+    var bgColor = snapshotBackgroundColor();
     var docW = Math.max(w, document.documentElement.scrollWidth || 0, document.body ? document.body.scrollWidth : 0);
     var docH = Math.max(h, document.documentElement.scrollHeight || 0, document.body ? document.body.scrollHeight : 0);
     var clone = document.documentElement.cloneNode(true);
     clone.setAttribute('xmlns', 'http://www.w3.org/1999/xhtml');
     inlineSnapshotStyles(document.documentElement, clone);
+    pruneHiddenSnapshotNodes(document.documentElement, clone);
     var scroll = scrollOffset();
     var cloneBody = clone.querySelector('body');
     var rootStyle = clone.getAttribute('style') || '';
@@ -279,7 +532,15 @@ function injectSnapshotBridge(doc: string): string {
         var ctx = canvas.getContext('2d');
         if (!ctx) throw new Error('no 2d context');
         ctx.scale(dpr, dpr);
+        // Opaque base so a transparent (un-painted) raster never flattens to
+        // pure black in clipboards / PNG viewers.
+        ctx.fillStyle = bgColor;
+        ctx.fillRect(0, 0, w, h);
         ctx.drawImage(img, 0, 0, w, h);
+        if (canvasLooksBlank(ctx, canvas.width, canvas.height)) {
+          window.parent.postMessage({ type: 'od:snapshot:result', id: id, error: 'empty-render' }, '*');
+          return;
+        }
         window.parent.postMessage({ type: 'od:snapshot:result', id: id, dataUrl: canvas.toDataURL('image/png'), w: canvas.width, h: canvas.height }, '*');
       } catch (err) {
         window.parent.postMessage({ type: 'od:snapshot:result', id: id, error: String(err && err.message || err) }, '*');
@@ -580,44 +841,56 @@ function annotateMissingOdIds(doc: string): string {
 }
 
 function injectManualEditBridge(doc: string): string {
-  const withStyle = injectBeforeHeadEnd(doc, buildManualEditBridgeStyle());
-  return injectBeforeBodyEnd(withStyle, buildManualEditBridge(true));
+  const withGuard = injectAfterHeadOpen(doc, buildManualEditKeyboardGuard());
+  const withStyle = injectBeforeHeadEnd(withGuard, buildManualEditBridgeStyle());
+  return injectBeforeBodyEnd(withStyle, buildManualEditBridge(false));
+}
+
+function injectAfterHeadOpen(doc: string, payload: string): string {
+  if (/<head[^>]*>/i.test(doc)) return doc.replace(/<head[^>]*>/i, (m) => `${m}${payload}`);
+  return payload + doc;
 }
 
 function injectBeforeHeadEnd(doc: string, payload: string): string {
-  if (typeof DOMParser !== 'undefined') {
-    try {
-      const parsed = new DOMParser().parseFromString(doc, 'text/html');
-      if (parsed.head) parsed.head.insertAdjacentHTML('beforeend', payload);
-      return serializeHtmlDocument(parsed);
-    } catch { /* DOMParser failed; fall through to string path */ }
-  }
-  // String fallback: find the real </head> (last one before <body>)
-  // to skip </head> literals inside <script>/<style> in <head>.
+  // String-first: a plain splice before the real </head> (or after <head…>) is
+  // correct for well-formed documents and avoids a full DOMParser parse +
+  // re-serialize. Every bridge calls this, so the parse path was the dominant
+  // srcdoc-build cost; DOMParser is now only the fallback for head-less
+  // fragments where we can't locate an insertion point textually. Find the real
+  // </head> (last one before <body>) to skip </head> literals in <script>/<style>.
   const lower = doc.toLowerCase();
   const bodyStart = lower.indexOf('<body');
   const limit = bodyStart >= 0 ? bodyStart : lower.length;
   const idx = lower.lastIndexOf('</head>', limit - 1);
   if (idx >= 0) return doc.slice(0, idx) + payload + doc.slice(idx);
   if (/<head[^>]*>/i.test(doc)) return doc.replace(/<head[^>]*>/i, (m) => `${m}${payload}`);
+  // No recognizable <head>: let DOMParser normalize (it synthesizes a head).
+  if (typeof DOMParser !== 'undefined') {
+    try {
+      const parsed = new DOMParser().parseFromString(doc, 'text/html');
+      if (parsed.head) parsed.head.insertAdjacentHTML('beforeend', payload);
+      return serializeHtmlDocument(parsed);
+    } catch { /* fall through to prepend */ }
+  }
   return payload + doc;
 }
 
 function injectBeforeBodyEnd(doc: string, payload: string): string {
-  if (typeof DOMParser !== 'undefined') {
-    try {
-      const parsed = new DOMParser().parseFromString(doc, 'text/html');
-      if (parsed.body) parsed.body.insertAdjacentHTML('beforeend', payload);
-      return serializeHtmlDocument(parsed);
-    } catch { /* DOMParser failed; fall through to string path */ }
-  }
-  // String fallback: find the real </body> (last one before </html>)
-  // to skip </body> literals inside <script>/<style> in <body>.
+  // String-first (see injectBeforeHeadEnd). Find the real </body> (last one
+  // before </html>) to skip </body> literals inside <script>/<style>.
   const lower = doc.toLowerCase();
   const htmlEnd = lower.lastIndexOf('</html>');
   const limit = htmlEnd >= 0 ? htmlEnd : lower.length;
   const idx = lower.lastIndexOf('</body>', limit - 1);
   if (idx >= 0) return doc.slice(0, idx) + payload + doc.slice(idx);
+  // No recognizable </body>: let DOMParser normalize (it synthesizes a body).
+  if (typeof DOMParser !== 'undefined') {
+    try {
+      const parsed = new DOMParser().parseFromString(doc, 'text/html');
+      if (parsed.body) parsed.body.insertAdjacentHTML('beforeend', payload);
+      return serializeHtmlDocument(parsed);
+    } catch { /* fall through to append */ }
+  }
   return doc + payload;
 }
 
@@ -819,6 +1092,7 @@ function injectSelectionBridge(
   var hoveredId = null;
   var drawing = false;
   var stroke = [];
+  var strokeFrame = null;
   var postTargetsTimer = null;
   // overrides[elementId] = { selector: '[data-od-id="x"]', props: { color: '#fff', ... } }
   var overrides = Object.create(null);
@@ -1239,6 +1513,17 @@ function meaningfulDomFallbackTarget(el) {
   function postStroke(type){
     window.parent.postMessage({ type: type, points: stroke.slice() }, '*');
   }
+  // Coalesce live stroke updates to one post per frame. The stroke array still
+  // grows synchronously on every pointermove, but the host (which re-renders
+  // the comment overlay on each od:pod-stroke) only sees ~60 updates/sec
+  // instead of one per raw pointer event.
+  function schedulePostStroke(){
+    if (strokeFrame !== null) return;
+    strokeFrame = requestAnimationFrame(function(){
+      strokeFrame = null;
+      postStroke('od:pod-stroke');
+    });
+  }
   function canUseDomFallback(){
     return commentEnabled && !inspectEnabled;
   }
@@ -1518,11 +1803,12 @@ function meaningfulDomFallbackTarget(el) {
     stroke.push(point);
     ev.preventDefault();
     ev.stopPropagation();
-    postStroke('od:pod-stroke');
+    schedulePostStroke();
   }, true);
   function finishStroke(ev){
     if (!drawing || mode !== 'pod') return;
     drawing = false;
+    if (strokeFrame !== null) { cancelAnimationFrame(strokeFrame); strokeFrame = null; }
     if (ev) {
       ev.preventDefault();
       ev.stopPropagation();
@@ -1538,9 +1824,19 @@ function meaningfulDomFallbackTarget(el) {
     schedulePostPreviewScroll();
   }, true);
   var mo = new MutationObserver(schedulePostTargets);
-  mo.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+  // childList only — NOT attributes/characterData. Re-walking every annotated
+  // target on every attribute/text mutation made an animated artifact (inline
+  // style/text changes per frame) churn schedulePostTargets continuously while
+  // in comment/inspect mode. Structural changes (childList) still re-walk, and
+  // scroll/resize already re-post geometry for layout shifts.
+  mo.observe(document.documentElement, { subtree: true, childList: true });
+  // The active comment marker still has to follow its own element's text and
+  // attribute edits, but schedulePostActiveCommentTarget re-posts exactly ONE
+  // element (the active comment), so it stays cheap even on animated artifacts —
+  // unlike the full allTargets() re-walk above. This is why attributes/
+  // characterData live on this targeted observer instead of the main observer.
   var textMo = new MutationObserver(schedulePostActiveCommentTarget);
-  textMo.observe(document.documentElement, { subtree: true, characterData: true });
+  textMo.observe(document.documentElement, { subtree: true, characterData: true, attributes: true });
   // Reflect the host-requested initial modes on the documentElement so
   // the cursor/hover styles match what the bridge picks up on click.
   if (commentEnabled) document.documentElement.toggleAttribute('data-od-comment-mode', true);
@@ -1737,10 +2033,17 @@ function injectDeckBridge(doc: string, initialSlideIndex = 0): string {
     return 0;
   }
   function dispatchKey(key){
-    // Bubbles so any listener on window picks it up too. We dispatch on
-    // document only — dispatching on window/body in addition would cause
-    // bubbling to fire the same document-level listener twice.
+    // Try window first: many deck frameworks listen on both window and
+    // document in capture phase for iframe focus resilience. Dispatching a
+    // bubbling event at document hits the document listener and then the
+    // window listener, turning one host "next" request into two slide moves.
     var init = { key: key, code: key, bubbles: true, cancelable: true, composed: true };
+    var before = activeIndex(slides());
+    try {
+      window.dispatchEvent(new KeyboardEvent('keydown', init));
+      window.dispatchEvent(new KeyboardEvent('keyup', init));
+    } catch (_) {}
+    if (activeIndex(slides()) !== before) return;
     try {
       document.dispatchEvent(new KeyboardEvent('keydown', init));
       document.dispatchEvent(new KeyboardEvent('keyup', init));
@@ -1849,15 +2152,25 @@ function injectDeckBridge(doc: string, initialSlideIndex = 0): string {
     var usesInlineDisplay = false;
     var usesInlineVisibility = false;
     var usesHidden = false;
+    // Many reveal-animation decks (the frontend-slides family) gate their
+    // staggered entrances on a SEPARATE \`.visible\` class — \`.slide.visible
+    // .reveal { opacity: 1 }\` — that the deck's own show() adds alongside
+    // \`.active\`. Driving navigation by flipping only the active class shows
+    // the slide chrome but leaves every .reveal child stuck at opacity:0, so
+    // the body renders blank. Mirror \`.visible\` in lock-step with the active
+    // slide (only for decks that actually use it, so it is a no-op elsewhere).
+    var usesVisibleClass = false;
     for (var j=0; j<list.length; j++) {
       usesInlineDisplay = usesInlineDisplay || list[j].style.display === 'none';
       usesInlineVisibility = usesInlineVisibility || list[j].style.visibility === 'hidden';
       usesHidden = usesHidden || list[j].hasAttribute('hidden');
+      usesVisibleClass = usesVisibleClass || (list[j].classList && list[j].classList.contains('visible'));
     }
     for (var k=0; k<list.length; k++) {
       if (list[k].classList) {
         list[k].classList.remove('active', 'is-active', 'current');
         if (k === target) list[k].classList.add(activeClass);
+        if (usesVisibleClass) list[k].classList.toggle('visible', k === target);
       }
       if (usesHidden) {
         if (k === target) list[k].removeAttribute('hidden');
